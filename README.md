@@ -1,4 +1,4 @@
-# PixelGen: Pixel Diffusion Beats Latent Diffusion with Perceptual Loss
+# PixelGen: Improving Pixel Diffusion with Perceptual Loss
 
 <div class="is-size-5 publication-authors", align="center",>
   <span class="author-block">
@@ -141,7 +141,7 @@ If you find PixelGen is useful in your research or applications, please consider
 
 ```
 @article{ma2026pixelgen,
-      title={PixelGen: Pixel Diffusion Beats Latent Diffusion with Perceptual Loss}, 
+      title={PixelGen: Improving Pixel Diffusion with Perceptual Loss}, 
       author={Zehong Ma and Ruihan Xu and Shiliang Zhang},
       year={2026},
       eprint={2602.02493},
