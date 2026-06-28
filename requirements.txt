@@ -8,6 +8,7 @@ torchvision
 timm
 accelerate
 gradio
+imageio[ffmpeg]
 wandb
 webdataset
 tensorboard
