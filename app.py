@@ -36,6 +36,7 @@ import os
 import torch
 import argparse
 import numpy as np
+import zipfile
 from omegaconf import OmegaConf
 from src.models.autoencoder.base import fp2uint8, uint82fp
 from src.diffusion.base.guidance import simple_guidance_fn
@@ -105,6 +106,21 @@ class Pipeline:
             )
             animations.append(gif_path)
         return animations
+
+    def _save_images(self, images, run_id):
+        image_paths = []
+        for i, image in enumerate(images):
+            image_path = os.path.join(self.tmp_dir.name, f"{run_id}_image_{i + 1}.png")
+            image.save(image_path)
+            image_paths.append(image_path)
+        return image_paths
+
+    def _write_zip(self, paths, run_id, name):
+        zip_path = os.path.join(self.tmp_dir.name, f"{run_id}_{name}.zip")
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path in paths:
+                archive.write(path, arcname=os.path.basename(path))
+        return zip_path
 
     def _prepare_input_image(self, input_image, num_images, image_height, image_width):
         if not isinstance(input_image, Image.Image):
@@ -211,8 +227,12 @@ class Pipeline:
 
         images = self._decode_images(samples)
         animations = self._decode_trajs(trajs)
+        run_id = f"{seed}_{random.randint(0, 100000)}"
+        image_paths = self._save_images(images, run_id)
+        image_zip = self._write_zip(image_paths, run_id, "images")
+        animation_zip = self._write_zip(animations, run_id, "trajs")
 
-        return images, animations
+        return image_paths, animations, image_zip, animation_zip
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -266,8 +286,10 @@ if __name__ == "__main__":
             with gr.Column(scale=2):
                 btn = gr.Button("Generate")
                 output_sample = gr.Gallery(label="Images", columns=2, rows=2)
+                output_images_zip = gr.File(label="Download images")
             with gr.Column(scale=2):
                 output_trajs = gr.Gallery(label="Trajs of Diffusion", columns=2, rows=2)
+                output_trajs_zip = gr.File(label="Download diffusion trajs")
 
         btn.click(fn=pipeline,
                   inputs=[
@@ -283,6 +305,6 @@ if __name__ == "__main__":
                       guidance,
                       timeshift,
                       order
-                  ], outputs=[output_sample, output_trajs])
+                  ], outputs=[output_sample, output_trajs, output_images_zip, output_trajs_zip])
     # demo.launch(server_name="0.0.0.0", server_port=23231)
     demo.launch(share=True, server_name="0.0.0.0", server_port=23231)
