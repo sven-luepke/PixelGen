@@ -35,12 +35,14 @@ import random
 import os
 import torch
 import argparse
+import numpy as np
 from omegaconf import OmegaConf
-from src.models.autoencoder.base import fp2uint8
+from src.models.autoencoder.base import fp2uint8, uint82fp
 from src.diffusion.base.guidance import simple_guidance_fn
 from src.diffusion.flow_matching.adam_sampling import AdamLMSamplerJiT
 from src.diffusion.flow_matching.scheduling import LinearScheduler
-from PIL import Image
+from src.diffusion.pre_integral import lagrange_preint
+from PIL import Image, ImageOps
 import gradio as gr
 import tempfile
 from huggingface_hub import snapshot_download
@@ -76,9 +78,109 @@ class Pipeline:
     def __del__(self):
         self.tmp_dir.cleanup()
 
+    def _decode_images(self, samples):
+        samples = self.vae.decode(samples)
+        samples = fp2uint8(samples)
+        samples = samples.permute(0, 2, 3, 1).cpu().numpy()
+        images = []
+        for i in range(len(samples)):
+            image = Image.fromarray(samples[i])
+            images.append(image)
+        return images
+
+    def _decode_trajs(self, trajs):
+        cat_trajs = torch.stack(trajs, dim=0).permute(1, 0, 2, 3, 4)
+        animations = []
+        for i in range(cat_trajs.shape[0]):
+            frames = self._decode_images(cat_trajs[i])
+            gif_filename = f"{random.randint(0, 100000)}.gif"
+            gif_path = os.path.join(self.tmp_dir.name, gif_filename)
+            frames[0].save(
+                gif_path,
+                format="GIF",
+                append_images=frames[1:],
+                save_all=True,
+                duration=200,
+                loop=0
+            )
+            animations.append(gif_path)
+        return animations
+
+    def _prepare_input_image(self, input_image, num_images, image_height, image_width):
+        if not isinstance(input_image, Image.Image):
+            input_image = Image.fromarray(input_image)
+        image = input_image.convert("RGB")
+        image = ImageOps.fit(image, (image_width, image_height), method=Image.Resampling.LANCZOS)
+        image = torch.from_numpy(np.array(image, copy=True)).permute(2, 0, 1)
+        image = uint82fp(image).unsqueeze(0).repeat(num_images, 1, 1, 1)
+        return self.vae.encode(image.to("cuda"))
+
+    def _build_truncated_solver_coeffs(self, timesteps, order, lms_transform_fn):
+        solver_coeffs = [[] for _ in range(len(timesteps) - 1)]
+        cpu_timesteps = timesteps.detach().cpu()
+        for i in range(len(cpu_timesteps) - 1):
+            pre_vs = [1.0] * (i + 1)
+            pre_ts = lms_transform_fn(cpu_timesteps[:i + 1])
+            int_t_start = lms_transform_fn(cpu_timesteps[i])
+            int_t_end = lms_transform_fn(cpu_timesteps[i + 1])
+            _, coeffs = lagrange_preint(min(order, i + 1), pre_vs, pre_ts, int_t_start, int_t_end)
+            solver_coeffs[i] = coeffs
+        return solver_coeffs
+
+    def _sample_from_t(self, sampler, x, start_t, condition, uncondition):
+        if start_t <= 1e-6:
+            return sampler(self.denoiser, x, condition, uncondition, return_x_trajs=True)
+        if start_t >= 1.0 - 1e-6:
+            return x, [x]
+
+        batch_size = x.shape[0]
+        full_timesteps = sampler.timesteps.to(x.device, x.dtype)
+        start_t = torch.tensor(start_t, device=x.device, dtype=x.dtype)
+        remaining = full_timesteps[full_timesteps > start_t]
+        if len(remaining) == 0 or remaining[-1] < 1.0:
+            remaining = torch.cat([remaining, torch.ones(1, device=x.device, dtype=x.dtype)])
+        timesteps = torch.cat([start_t.view(1), remaining])
+        solver_coeffs = self._build_truncated_solver_coeffs(
+            timesteps,
+            sampler.order,
+            sampler.lms_transform_fn,
+        )
+
+        cfg_condition = torch.cat([uncondition, condition], dim=0)
+        pred_trajectory = []
+        x_trajectory = [x]
+        t_cur = timesteps[0].repeat(batch_size)
+
+        for i, t_next in enumerate(timesteps[1:]):
+            cfg_x = torch.cat([x, x], dim=0)
+            cfg_t = t_cur.repeat(2)
+            out = self.denoiser(cfg_x, cfg_t, cfg_condition)
+            out = (out - cfg_x) / (1.0 - cfg_t.view(-1, 1, 1, 1)).clamp_min(5e-2)
+            if t_cur[0] > sampler.guidance_interval_min and t_cur[0] < sampler.guidance_interval_max:
+                out = sampler.guidance_fn(out, sampler.guidance)
+            else:
+                out = sampler.guidance_fn(out, 1.0)
+
+            pred_trajectory.append(out)
+            v = torch.zeros_like(out)
+            order = len(solver_coeffs[i])
+            for j in range(order):
+                v += solver_coeffs[i][j] * pred_trajectory[-order:][j]
+            x = sampler.step_fn(x, v, t_next - t_cur[0], s=0, w=0)
+            t_cur = t_next.repeat(batch_size)
+            x_trajectory.append(x)
+
+        return x_trajectory[-1], x_trajectory
+
     @torch.no_grad()
     @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-    def __call__(self, y, neg_prompt, num_images, seed, image_height, image_width, num_steps, guidance, timeshift, order):
+    def __call__(self, input_image, noise_level, y, neg_prompt, num_images, seed, image_height, image_width, num_steps, guidance, timeshift, order):
+        num_images = int(num_images)
+        seed = int(seed)
+        image_height = int(image_height)
+        image_width = int(image_width)
+        num_steps = int(num_steps)
+        order = int(order)
         diffusion_sampler = AdamLMSamplerJiT(
             order=order,
             scheduler=LinearScheduler(),
@@ -96,45 +198,19 @@ class Pipeline:
                          generator=generator)
         xT = xT.to("cuda")
         with torch.no_grad():
-            condition, uncondition = conditioner([y,]*num_images, {"negative_prompt": neg_prompt})
+            condition, uncondition = self.conditioner([y,]*num_images, {"negative_prompt": neg_prompt})
 
+        if input_image is not None:
+            image_x0 = self._prepare_input_image(input_image, num_images, image_height, image_width)
+            noise_level = max(0.0, min(1.0, noise_level))
+            start_t = 1.0 - noise_level
+            xT = start_t * image_x0 + noise_level * xT
+            samples, trajs = self._sample_from_t(diffusion_sampler, xT, start_t, condition, uncondition)
+        else:
+            samples, trajs = diffusion_sampler(self.denoiser, xT, condition, uncondition, return_x_trajs=True)
 
-        # Sample images:
-        samples, trajs = diffusion_sampler(denoiser, xT, condition, uncondition, return_x_trajs=True)
-
-        def decode_images(samples):
-            samples = vae.decode(samples)
-            samples = fp2uint8(samples)
-            samples = samples.permute(0, 2, 3, 1).cpu().numpy()
-            images = []
-            for i in range(len(samples)):
-                image = Image.fromarray(samples[i])
-                images.append(image)
-            return images
-
-        def decode_trajs(trajs):
-            cat_trajs = torch.stack(trajs, dim=0).permute(1, 0, 2, 3, 4)
-            animations = []
-            for i in range(cat_trajs.shape[0]):
-                frames = decode_images(
-                    cat_trajs[i]
-                )
-                # 生成唯一文件名（结合seed和样本索引，避免冲突）
-                gif_filename = f"{random.randint(0, 100000)}.gif"
-                gif_path = os.path.join(self.tmp_dir.name, gif_filename)
-                frames[0].save(
-                    gif_path,
-                    format="GIF",
-                    append_images=frames[1:],
-                    save_all=True,
-                    duration=200,
-                    loop=0
-                )
-                animations.append(gif_path)
-            return animations
-
-        images = decode_images(samples)
-        animations = decode_trajs(trajs)
+        images = self._decode_images(samples)
+        animations = self._decode_trajs(trajs)
 
         return images, animations
 
@@ -180,6 +256,8 @@ if __name__ == "__main__":
                 image_height = gr.Slider(minimum=128, maximum=1024, step=32, label="image height", value=512)
                 image_width = gr.Slider(minimum=128, maximum=1024, step=32, label="image width", value=512)
                 num_images = gr.Slider(minimum=1, maximum=4, step=1, label="num images", value=4)
+                input_image = gr.Image(label="input image", type="pil")
+                noise_level = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="SDEdit noise level", value=0.5)
                 label = gr.Textbox(label="positive prompt", value="A beautiful woman.")
                 neg_label = gr.Textbox(label="negative prompt", value="Unrealistic, JPEG artifacts.")
                 seed = gr.Slider(minimum=0, maximum=1000000, step=1, label="seed", value=0)
@@ -193,6 +271,8 @@ if __name__ == "__main__":
 
         btn.click(fn=pipeline,
                   inputs=[
+                      input_image,
+                      noise_level,
                       label,
                       neg_label,
                       num_images,
